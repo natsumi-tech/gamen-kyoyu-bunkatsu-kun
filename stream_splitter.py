@@ -310,7 +310,12 @@ class Viewer:
 
     def update(self):
         """対象ウィンドウの大きさ・自ウィンドウの大きさに合わせて表示範囲を更新"""
-        src = self.app.src_hwnd
+        # 配信はメイン画面にも、ポップアウトした別ウィンドウにもあり得るので、配信ごとの映し元を使う
+        entry = self.app.auto_fracs.get(self.auto_name)
+        if entry:
+            src, self.frac = entry
+        else:
+            src, self.frac = (self.thumb_src or self.app.src_hwnd), None
         if not src or not user32.IsWindow(src):
             self.unregister()
             return
@@ -322,8 +327,6 @@ class Viewer:
             return
         sw, sh = client_size(src)
         dw, dh = self.win.winfo_width(), self.win.winfo_height()
-        if self.auto_name:
-            self.frac = self.app.auto_fracs.get(self.auto_name)
         if user32.IsIconic(src):
             self.label.config(text="Discord が最小化されているため映せません\n"
                                    "最小化の代わりに「Discord を隠す」を使ってください")
@@ -425,17 +428,21 @@ class AutoDetector(threading.Thread):
             return
         last_err = None
         while not self.stop.wait(0.7):
-            hwnd = self.app.src_hwnd
-            if not self.app.auto_mode_on or not hwnd or not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
+            if not self.app.auto_mode_on:
                 continue
-            try:
-                self.app.scan_result = (hwnd, scanner.scan(hwnd))
-                last_err = None
-            except Exception as e:
-                self.app.scan_result = None
-                if repr(e) != last_err:  # 同じエラーを 0.7 秒ごとに書き続けない
-                    log_error("scan", e)
-                    last_err = repr(e)
+            # メイン画面＋ポップアウトした配信ウィンドウをすべて読む（最小化中のものは位置が取れないので除く）
+            results = []
+            for hwnd in list(self.app.discord_windows):
+                if not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
+                    continue
+                try:
+                    results.append((hwnd, scanner.scan(hwnd)))
+                    last_err = None
+                except Exception as e:
+                    if repr(e) != last_err:  # 同じエラーを 0.7 秒ごとに書き続けない
+                        log_error("scan", e)
+                        last_err = repr(e)
+            self.app.scan_result = results
 
 
 # ---------------------------------------------------------------- メイン画面
@@ -466,12 +473,17 @@ class App:
         self.auto_hide_min = tk.BooleanVar(value=cfg.get("auto_hide_min", True))
         self.hq_size = tk.StringVar(value=cfg.get("hq_size", "auto"))
         self.stream_count = 0
-        self.hq_requested = None  # 最後に要求した隠し中の大きさ
-        self.hidden_saved = None  # Discord を隠す前の位置（戻すときに使う）
+        self.hq_requested = {}  # ウィンドウ → 最後に要求した隠し中の大きさ
+        self.hidden = {}  # 隠している Discord のウィンドウ → 隠す前の位置（戻すときに使う）
+        self.discord_windows = []  # Discord のメイン画面＋ポップアウトした配信ウィンドウ
+        self.window_stream_counts = {}  # ウィンドウ → 中にある配信の数
         self.prev_fg = False
-        self.pending_restore = cfg.get("discord_hidden")  # 前回、隠したまま終了していた場合
-        if not (isinstance(self.pending_restore, dict) and _valid_placement(self.pending_restore)):
-            self.pending_restore = None
+        # 前回、隠したまま終了していた場合の元の位置（旧バージョンは 1 つだけの dict で保存していた）
+        pending = cfg.get("discord_hidden")
+        if isinstance(pending, dict):
+            pending = [pending]
+        self.pending_restore = [p for p in pending if isinstance(p, dict) and _valid_placement(p)] \
+            if isinstance(pending, list) else []
         self.startup_checked = False
         self.quitting = False
         self.tick_job = None
@@ -589,87 +601,117 @@ class App:
         else:
             self.show_discord()
 
+    def hide_window(self, h):
+        """Discord のウィンドウ 1 つを隠す（既に隠している最中なら最初の位置を残す）"""
+        saved = hider.hide(h)
+        self.hidden.setdefault(h, saved)
+        self.hq_requested.pop(h, None)  # 隠し直したら大きさも設定し直す
+
     def hide_discord(self):
-        h = self.src_hwnd
-        if not h or not user32.IsWindow(h):
+        """メイン画面とポップアウトした配信ウィンドウをまとめて隠す"""
+        wins = [h for h in self.discord_windows if user32.IsWindow(h)]
+        if not wins:
             messagebox.showwarning(APP_NAME, "Discord のウィンドウが見つかりません。")
             return False
-        saved = hider.hide(h)
-        self.hq_requested = None  # 隠し直したら大きさも設定し直す
-        self.prev_fg = user32.GetForegroundWindow() == h  # 隠した直後に「開いた」と誤判定しない
-        if self.hidden_saved is None:  # 既に隠している最中なら最初の位置を残す
-            self.hidden_saved = saved
+        for h in wins:
+            self.hide_window(h)
+        self.prev_fg = user32.GetForegroundWindow() in self.hidden  # 隠した直後に「開いた」と誤判定しない
         self.hide_var.set(True)
         self.persist_hidden()
         self.apply_hq_size()
         self.status.config(text="Discord を隠しました。タスクバーの Discord をクリックするか、スイッチをオフにすると戻ります。")
         return True
 
-    def show_discord(self, activate=True):
-        h = self.src_hwnd
-        if self.hidden_saved and h and user32.IsWindow(h):
-            hider.show(h, self.hidden_saved, activate)
-        self.hidden_saved = None
+    def show_discord(self, activate=None):
+        """隠した Discord のウィンドウをすべて元に戻す。activate: 前面に出すウィンドウ（既定はメイン画面）"""
+        if activate is None or activate is True:
+            activate = self.src_hwnd
+        for h, saved in list(self.hidden.items()):
+            if user32.IsWindow(h):
+                hider.show(h, saved, activate=(h == activate))
+        self.hidden = {}
+        self.hq_requested = {}
         self.hide_var.set(False)
         self.persist_hidden()
         if self.status.cget("text").startswith("Discord を隠しました"):
             self.status.config(text="")
 
     def apply_hq_size(self):
-        """隠している間だけ、Discord を画質設定の大きさにする"""
-        h = self.src_hwnd
+        """隠している間だけ、Discord を画質設定の大きさにする（ウィンドウごとに、中の配信数に合わせる）"""
         mode = self.hq_size.get()
-        if not self.hidden_saved or not h or not user32.IsWindow(h) or user32.IsIconic(h):
+        shown = []
+        for h, saved in self.hidden.items():
+            if not user32.IsWindow(h) or user32.IsIconic(h):
+                continue
+            count = self.window_stream_counts.get(h, 0) if len(self.hidden) > 1 else self.stream_count
+            target = hq_target(mode, count)
+            if target is None:  # そのまま → 隠す前の大きさ
+                target = tuple(saved.get("hidden_size") or hider.window_size(h))
+            # 同じ大きさを要求済みなら繰り返さない（Windows/Discord 側で大きさを制限された場合の空回り防止）
+            if target != self.hq_requested.get(h) and hider.window_size(h) != target:
+                hider.resize_hidden(h, *target)
+            self.hq_requested[h] = target
+            shown.append((h, hider.window_size(h), target))
+        if not shown:
             self.hq_label.config(text="Discord を隠すと、その間だけ大きく描画して画質を上げます")
             return
-        target = hq_target(mode, self.stream_count)
-        if target is None:  # そのまま → 隠す前の大きさ
-            target = tuple(self.hidden_saved.get("hidden_size") or hider.window_size(h))
-        # 同じ大きさを要求済みなら繰り返さない（Windows/Discord 側で大きさを制限された場合の空回り防止）
-        if target != self.hq_requested and hider.window_size(h) != target:
-            hider.resize_hidden(h, *target)
-        self.hq_requested = target
-        actual = hider.window_size(h)
+        main = next((x for x in shown if x[0] == self.src_hwnd), shown[0])
+        _, actual, target = main
         text = f"いまの Discord の大きさ: {actual[0]}×{actual[1]}"
         if actual != target:
             text += f"（{target[0]}×{target[1]} を指定しましたが、この PC では制限されました）"
         elif mode == "auto":
             text += f"（配信 {self.stream_count} 件に合わせて自動）"
+        if len(shown) > 1:
+            text += f"\nポップアウトした配信ウィンドウ {len(shown) - 1} 個も一緒に隠しています"
         self.hq_label.config(text=text)
 
     def persist_hidden(self):
         """隠したままアプリが落ちても次回起動時に戻せるよう保存"""
         try:
             cfg = self.read_cfg()
-            cfg["discord_hidden"] = self.hidden_saved
+            cfg["discord_hidden"] = list(self.hidden.values()) or None
             self.write_cfg(cfg)
-        except Exception:
-            pass
+        except Exception as e:
+            log_error("persist_hidden", e)
 
     def watch_discord_window(self):
-        h = self.src_hwnd
-        if not h or not user32.IsWindow(h):
+        wins = [h for h in self.discord_windows if user32.IsWindow(h)]
+        if not wins:
             return
         if not self.startup_checked:
             # 前回、隠したまま強制終了/シャットダウンした等で Discord が画面外に残っていたら戻す
             # （モニター構成が変わっていても戻せるよう「ほぼ画面外か」で判定）
             self.startup_checked = True
-            if hider.is_mostly_offscreen(h):
-                if self.pending_restore:
-                    hider.show(h, self.pending_restore, activate=False)
-                if hider.is_mostly_offscreen(h):  # 元の位置も画面外（モニターを外した等）
-                    hider.rescue(h)
+            rescued = False
+            for h in wins:
+                if hider.is_mostly_offscreen(h):
+                    if self.pending_restore:
+                        hider.show(h, self.pending_restore.pop(0), activate=False)
+                    if hider.is_mostly_offscreen(h):  # 元の位置も画面外（モニターを外した等）
+                        hider.rescue(h)
+                    rescued = True
+            if rescued:
                 self.status.config(text="画面外に残っていた Discord を元に戻しました。")
-            if self.pending_restore:
-                self.pending_restore = None
-                self.persist_hidden()
-        fg = user32.GetForegroundWindow() == h
-        if user32.IsIconic(h) and (self.hidden_saved or self.auto_hide_min.get()):
-            self.hide_discord()  # 最小化 → 代わりに隠す（最小化すると配信の描画が止まるため）
-            fg = user32.GetForegroundWindow() == h
-        elif self.hidden_saved and fg and not self.prev_fg:
-            self.show_discord()  # タスクバー等から Discord を開いた瞬間 → 元の位置に戻す
-        self.prev_fg = fg
+            self.pending_restore = []
+            self.persist_hidden()
+        just_hidden = False
+        for h in wins:
+            # 最小化 → 代わりに隠す（最小化すると配信の描画が止まるため）。ポップアウトした配信ウィンドウも同様
+            if user32.IsIconic(h) and (self.hidden or self.auto_hide_min.get()):
+                self.hide_window(h)
+                just_hidden = True
+        if just_hidden:
+            self.hide_var.set(True)
+            self.persist_hidden()
+            self.status.config(text="Discord を隠しました。タスクバーの Discord をクリックするか、スイッチをオフにすると戻ります。")
+        fg = user32.GetForegroundWindow()
+        fg_hidden = fg in self.hidden
+        if fg_hidden and not self.prev_fg and not just_hidden:
+            self.show_discord(activate=fg)  # タスクバー等から隠した Discord を開いた瞬間 → 元の位置に戻す
+            fg_hidden = False
+        self.prev_fg = fg_hidden
+        self.hidden = {h: s for h, s in self.hidden.items() if user32.IsWindow(h)}  # 閉じられたウィンドウは忘れる
         self.apply_hq_size()  # 配信数が変わったら自動の大きさを追従
 
     def toggle_settings(self):
@@ -711,8 +753,8 @@ class App:
     def set_status(self):
         name = os.path.splitext(self.target_exe)[0]
         if self.src_hwnd and user32.IsWindow(self.src_hwnd):
-            self.hide_icon.config(fg=C["accent"] if self.hidden_saved else C["sub"])
-            if self.hidden_saved:
+            self.hide_icon.config(fg=C["accent"] if self.hidden else C["sub"])
+            if self.hidden:
                 self.pill_dot.config(fg=C["accent"])
                 self.pill_text.config(text=f"{name} 非表示中")
             elif user32.IsIconic(self.src_hwnd):
@@ -747,6 +789,10 @@ class App:
                 self.src_hwnd = None
                 self.refresh_windows()
                 self.set_source(hwnd, self.target_exe)
+        # メイン画面を先頭に、同じアプリのほかのウィンドウ（ポップアウトした配信）も対象にする
+        others = [w[0] for w in list_windows()
+                  if w[1].lower() == self.target_exe.lower() and w[0] != self.src_hwnd]
+        self.discord_windows = ([self.src_hwnd] if self.src_hwnd and user32.IsWindow(self.src_hwnd) else []) + others
         self.watch_discord_window()
         if self.auto_mode_on:
             self.apply_scan()
@@ -777,23 +823,33 @@ class App:
             self.detect_icon.config(fg=C["red"])
             self.detect_label.config(text=f"自動検出を開始できませんでした: {self.scan_error}")
             return
-        res = self.scan_result
-        if not res or res[0] != self.src_hwnd:
+        results = self.scan_result
+        if results is None:
             self.detect_label.config(text="Discord の画面を読み取り中…")
             return
-        hwnd, data = res
-        cw, ch = client_size(hwnd)
-        if cw <= 0 or ch <= 0:
-            return
-        fracs = {}
-        for name, (l, t, r, b) in data["tiles"]:
-            p0, p1 = wintypes.POINT(l, t), wintypes.POINT(r, b)
-            user32.ScreenToClient(hwnd, ctypes.byref(p0))
-            user32.ScreenToClient(hwnd, ctypes.byref(p1))
-            frac = [max(0.0, min(1.0, v)) for v in (p0.x / cw, p0.y / ch, p1.x / cw, p1.y / ch)]
-            if frac[2] - frac[0] > 0.01 and frac[3] - frac[1] > 0.01:
-                fracs[name] = frac
+        fracs, best_area, live_users = {}, {}, []
+        self.window_stream_counts = {}
+        for hwnd, data in results:
+            cw, ch = client_size(hwnd)
+            if cw <= 0 or ch <= 0:
+                continue
+            for name, (l, t, r, b) in data["tiles"]:
+                p0, p1 = wintypes.POINT(l, t), wintypes.POINT(r, b)
+                user32.ScreenToClient(hwnd, ctypes.byref(p0))
+                user32.ScreenToClient(hwnd, ctypes.byref(p1))
+                frac = [max(0.0, min(1.0, v)) for v in (p0.x / cw, p0.y / ch, p1.x / cw, p1.y / ch)]
+                area = (p1.x - p0.x) * (p1.y - p0.y)
+                # 同じ配信が複数のウィンドウに出ていたら、大きく映っている方を使う
+                if frac[2] - frac[0] > 0.01 and frac[3] - frac[1] > 0.01 and area > best_area.get(name, 0):
+                    fracs[name] = (hwnd, frac)
+                    best_area[name] = area
+            for u in data["live_users"]:
+                if u not in live_users:
+                    live_users.append(u)
+        for hwnd, _ in fracs.values():
+            self.window_stream_counts[hwnd] = self.window_stream_counts.get(hwnd, 0) + 1
         self.auto_fracs = fracs
+        data = {"live_users": live_users}
 
         # 消えた配信は「閉じた」扱いを解除（次に出てきたら再び自動表示）
         self.dismissed &= set(fracs)
@@ -805,7 +861,7 @@ class App:
             d = self.auto_geometries.get(name)
             if not isinstance(d, dict):
                 d = {}
-            self.viewers.append(Viewer(self, name, fracs[name], d.get("geometry"), d.get("topmost", False),
+            self.viewers.append(Viewer(self, name, fracs[name][1], d.get("geometry"), d.get("topmost", False),
                                        d.get("keep_aspect", True), d.get("opacity", 255), auto_name=name))
             self.refresh_list()
 
@@ -913,7 +969,7 @@ class App:
         cfg = self.read_cfg()
         cfg.update({"target_exe": self.target_exe, "auto_mode": self.auto_mode.get(),
                     "auto_geometries": self.auto_geometries, "auto_hide_min": self.auto_hide_min.get(),
-                    "discord_hidden": self.hidden_saved, "hq_size": self.hq_size.get()})
+                    "discord_hidden": list(self.hidden.values()) or None, "hq_size": self.hq_size.get()})
         self.write_cfg(cfg)
 
     def quit(self):
@@ -921,7 +977,7 @@ class App:
         if self.tick_job:
             self.root.after_cancel(self.tick_job)
         self.detector.stop.set()
-        if self.hidden_saved:  # 隠したまま終了しない
+        if self.hidden:  # 隠したまま終了しない
             self.show_discord(activate=False)
         try:
             self.save_settings()
