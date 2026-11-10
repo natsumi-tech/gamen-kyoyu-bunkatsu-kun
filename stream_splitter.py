@@ -20,7 +20,7 @@ except Exception:
     DiscordScanner = None
 
 import hider
-from ui_widgets import (C, FONT, FONT_BOLD, ICON_FONT, ICONS, Card, IconButton, RoundButton, Segmented, Toggle,
+from ui_widgets import (C, FONT, FONT_BOLD, ICON_FONT, ICONS, Card, IconButton, Segmented, Toggle,
                         dark_titlebar, label, rounded_rect, setup_ttk)
 
 # 隠している間の Discord の大きさ。大きいほど配信タイルが高解像度で描かれ、拡大してもぼやけない
@@ -33,11 +33,6 @@ def _valid_placement(d):
     n = d.get("normal")
     return (isinstance(n, list) and len(n) == 4 and all(isinstance(v, int) for v in n)
             and isinstance(d.get("flags"), int) and isinstance(d.get("showCmd"), int))
-
-
-def _valid_frac(f):
-    return (isinstance(f, (list, tuple)) and len(f) == 4 and all(isinstance(v, (int, float)) for v in f)
-            and 0 <= f[0] < f[2] <= 1 and 0 <= f[1] < f[3] <= 1)
 
 
 def hq_target(mode, stream_count):
@@ -224,93 +219,6 @@ def toplevel_hwnd(widget):
     return user32.GetParent(widget.winfo_id()) or widget.winfo_id()
 
 
-# ---------------------------------------------------------------- 範囲選択オーバーレイ
-class RegionSelector:
-    """対象ウィンドウを前面に出し、画面全体に半透明の膜をかけてドラッグで範囲を選ぶ。"""
-
-    def __init__(self, root, src_hwnd, on_done):
-        self.root = root
-        self.src = src_hwnd
-        self.on_done = on_done
-        self.start = None
-        self.rect_id = None
-
-        if user32.IsIconic(src_hwnd):
-            user32.ShowWindow(src_hwnd, 9)  # SW_RESTORE
-        user32.SetForegroundWindow(src_hwnd)
-
-        vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
-        vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
-        self.origin = (vx, vy)
-
-        self.win = tk.Toplevel(root)
-        self.win.overrideredirect(True)
-        self.win.geometry(f"{vw}x{vh}+{vx}+{vy}")
-        self.win.attributes("-topmost", True)
-        self.win.attributes("-alpha", 0.35)
-        self.cv = tk.Canvas(self.win, bg="black", highlightthickness=0, cursor="crosshair")
-        self.cv.pack(fill="both", expand=True)
-
-        # 対象ウィンドウの位置を枠で示す
-        cw, ch = client_size(src_hwnd)
-        p = wintypes.POINT(0, 0)
-        user32.ClientToScreen(src_hwnd, ctypes.byref(p))
-        self.cv.create_rectangle(p.x - vx, p.y - vy, p.x - vx + cw, p.y - vy + ch,
-                                 outline="#5865F2", width=4)
-        self.cv.create_text(p.x - vx + cw // 2, p.y - vy + 40, fill="white",
-                            font=("Yu Gothic UI", 20, "bold"),
-                            text="切り出したい配信をドラッグで囲んでください（Esc でキャンセル）")
-
-        self.cv.bind("<ButtonPress-1>", self.press)
-        self.cv.bind("<B1-Motion>", self.drag)
-        self.cv.bind("<ButtonRelease-1>", self.release)
-        self.win.bind("<Escape>", lambda e: self.finish(None))
-        self.win.after(50, self.grab_focus)
-
-    def grab_focus(self):
-        self.win.lift()
-        self.win.focus_force()
-
-    def press(self, e):
-        self.start = (e.x, e.y)
-        self.rect_id = self.cv.create_rectangle(e.x, e.y, e.x, e.y, outline="red", width=3, fill="white")
-
-    def drag(self, e):
-        if self.start:
-            self.cv.coords(self.rect_id, self.start[0], self.start[1], e.x, e.y)
-
-    def release(self, e):
-        if not self.start:
-            return
-        x0, y0 = self.start
-        x1, y1 = e.x, e.y
-        if abs(x1 - x0) < 20 or abs(y1 - y0) < 20:
-            self.cv.delete(self.rect_id)
-            self.start = None
-            return
-        # スクリーン座標 → 対象ウィンドウのクライアント座標 → 割合
-        ox, oy = self.origin
-        p0 = wintypes.POINT(min(x0, x1) + ox, min(y0, y1) + oy)
-        p1 = wintypes.POINT(max(x0, x1) + ox, max(y0, y1) + oy)
-        user32.ScreenToClient(self.src, ctypes.byref(p0))
-        user32.ScreenToClient(self.src, ctypes.byref(p1))
-        cw, ch = client_size(self.src)
-        if cw <= 0 or ch <= 0:
-            self.finish(None)
-            return
-        clamp = lambda v: max(0.0, min(1.0, v))
-        frac = [clamp(p0.x / cw), clamp(p0.y / ch), clamp(p1.x / cw), clamp(p1.y / ch)]
-        if frac[2] - frac[0] <= 0.01 or frac[3] - frac[1] <= 0.01:
-            messagebox.showwarning(APP_NAME, "対象ウィンドウの内側を選んでください。")
-            self.finish(None)
-            return
-        self.finish(frac)
-
-    def finish(self, frac):
-        self.win.destroy()
-        self.on_done(frac)
-
-
 # ---------------------------------------------------------------- 切り出しウィンドウ
 class Viewer:
     def __init__(self, app, name, frac, geometry=None, topmost=False, keep_aspect=True, opacity=255,
@@ -318,7 +226,7 @@ class Viewer:
         self.app = app
         self.name = name
         self.frac = frac  # [left, top, right, bottom] 対象ウィンドウに対する割合
-        self.auto_name = auto_name  # 自動検出した配信のユーザー名（手動切り出しなら None）
+        self.auto_name = auto_name  # 自動検出した配信のユーザー名
         self.topmost = tk.BooleanVar(value=bool(topmost))
         self.keep_aspect = tk.BooleanVar(value=bool(keep_aspect))
         try:
@@ -359,7 +267,6 @@ class Viewer:
         self.menu.add_cascade(label="不透明度", menu=op)
         self.menu.add_command(label="全画面 切替（ダブルクリック）", command=self.toggle_fullscreen)
         self.menu.add_separator()
-        self.menu.add_command(label="範囲を選び直す", command=self.reselect)
         self.menu.add_command(label="名前を変更", command=self.rename)
         self.menu.add_separator()
         self.menu.add_command(label="このウィンドウを閉じる", command=self.close)
@@ -474,16 +381,6 @@ class Viewer:
         self.win.attributes("-fullscreen", self.fullscreen)
         self.win.after(100, self.update)
 
-    def reselect(self):
-        self.app.select_region(lambda frac: frac and self.set_frac(frac))
-
-    def set_frac(self, frac):
-        if self.auto_name:  # 手動で選び直したら自動追従をやめる
-            self.app.dismissed.add(self.auto_name)
-            self.auto_name = None
-        self.frac = frac
-        self.update()
-
     def rename(self):
         n = simpledialog.askstring(APP_NAME, "新しい名前:", initialvalue=self.name, parent=self.win)
         if n:
@@ -556,12 +453,11 @@ class App:
         self.windows = []
         self.cfg_path = os.path.join(DATA_DIR, "layout.json")
         cfg = self.read_cfg()
-        self.auto_restore = tk.BooleanVar(value=cfg.get("auto_restore", True))
         self.auto_mode = tk.BooleanVar(value=cfg.get("auto_mode", True) and DiscordScanner is not None)
         self.auto_mode_on = self.auto_mode.get()
         self.auto_geometries = cfg.get("auto_geometries", {})  # ユーザー名 → 前回のウィンドウ位置など
         self.auto_fracs = {}  # ユーザー名 → 現在の配信タイルの範囲（割合）
-        self.dismissed = set()  # 手動で閉じた自動ウィンドウ（その配信が消えるまで再表示しない）
+        self.dismissed = set()  # ユーザーが閉じたウィンドウ（その配信が消えるまで再表示しない）
         self.scan_result = None
         self.scan_error = None
         self.rows = {}  # Viewer → (dot ラベル, ピンボタン)
@@ -641,16 +537,6 @@ class App:
         label(sh, "切り出し中のウィンドウ", 9, "muted", bold=True).pack(side="left")
         self.count_badge = tk.Label(sh, text="0", bg=C["card"], fg=C["sub"], font=(FONT_BOLD, 8), padx=6)
         self.count_badge.pack(side="left", padx=6)
-        add = label(sh, ICONS["add"] + "", 9, "accent")
-        add.configure(font=(ICON_FONT, 9), cursor="hand2")
-        add2 = label(sh, "範囲を指定して追加", 9, "accent")
-        add2.configure(cursor="hand2")
-        add2.pack(side="right")
-        add.pack(side="right", padx=(0, 4))
-        for w in (add, add2):
-            w.bind("<ButtonRelease-1>", lambda e: self.add_viewer())
-            w.bind("<Enter>", lambda e: add2.configure(font=(FONT, 9, "underline")))
-            w.bind("<Leave>", lambda e: add2.configure(font=(FONT, 9)))
         self.list_frame = tk.Frame(outer, bg=C["bg"])
         self.list_frame.grid(row=4, column=0, sticky="we")
         self.list_frame.columnconfigure(0, weight=1)
@@ -676,21 +562,10 @@ class App:
         self.combo.grid(row=1, column=0, sticky="we", pady=(4, 0))
         self.combo.bind("<<ComboboxSelected>>", self.on_combo)
         IconButton(s, "refresh", self.refresh_windows, "ウィンドウ一覧を更新").grid(row=1, column=1, padx=(6, 0))
-        rr = tk.Frame(s, bg=C["card"])
-        rr.grid(row=2, column=0, columnspan=2, sticky="we", pady=(12, 0))
-        label(rr, "起動時に前回の配置を復元", 10).pack(side="left")
-        Toggle(rr, self.auto_restore).pack(side="right")
         rh = tk.Frame(s, bg=C["card"])
-        rh.grid(row=3, column=0, columnspan=2, sticky="we", pady=(10, 0))
+        rh.grid(row=2, column=0, columnspan=2, sticky="we", pady=(12, 0))
         label(rh, "Discord を最小化したら、代わりに隠す", 10).pack(side="left")
         Toggle(rh, self.auto_hide_min).pack(side="right")
-        br = tk.Frame(s, bg=C["card"])
-        br.grid(row=4, column=0, columnspan=2, sticky="we", pady=(12, 0))
-        br.columnconfigure((0, 1), weight=1)
-        RoundButton(br, "配置を保存", self.save_layout, ICONS["save"], "secondary", 34, 9).grid(
-            row=0, column=0, sticky="we", padx=(0, 4))
-        RoundButton(br, "配置を読み込む", self.load_layout, ICONS["open"], "secondary", 34, 9).grid(
-            row=0, column=1, sticky="we", padx=(4, 0))
 
         self.status = label(outer, "", 8, "muted", anchor="w", justify="left", wraplength=420)
         self.status.grid(row=7, column=0, sticky="we", pady=(12, 0))
@@ -701,9 +576,7 @@ class App:
         self.refresh_windows()
         self.refresh_list()
         if not self.auto_mode_on:
-            self.detect_label.config(text="オフ ・ 手動で範囲を指定して切り出せます")
-        if self.auto_restore.get() and cfg.get("viewers"):
-            self.root.after(300, lambda: self.apply_layout(cfg))
+            self.detect_label.config(text="オフ")
         self.detector = AutoDetector(self)
         self.detector.start()
         self.tick_job = self.root.after(500, self.tick)
@@ -891,11 +764,11 @@ class App:
         if DiscordScanner is None and self.auto_mode_on:
             self.auto_mode.set(False)
             self.auto_mode_on = False
-            messagebox.showwarning(APP_NAME, "自動検出の部品が読み込めませんでした。手動で切り出してください。")
+            messagebox.showwarning(APP_NAME, "自動検出の部品が読み込めませんでした。")
         if not self.auto_mode_on:
             self.auto_fracs = {}
             self.detect_icon.config(fg=C["muted"])
-            self.detect_label.config(text="オフ ・ 手動で範囲を指定して切り出せます")
+            self.detect_label.config(text="オフ")
         else:
             self.detect_label.config(text="Discord の画面を読み取り中…")
 
@@ -922,7 +795,7 @@ class App:
                 fracs[name] = frac
         self.auto_fracs = fracs
 
-        # 消えた配信は「手動で閉じた」扱いを解除（次に出てきたら再び自動表示）
+        # 消えた配信は「閉じた」扱いを解除（次に出てきたら再び自動表示）
         self.dismissed &= set(fracs)
 
         open_names = {v.auto_name for v in self.viewers if v.auto_name}
@@ -952,36 +825,7 @@ class App:
             msg += "\nDiscord で通話中のボイスチャンネルを開き、配信を視聴してください"
         self.detect_label.config(text=msg)
 
-    # --- 切り出し
-    def select_region(self, callback):
-        if not self.src_hwnd or not user32.IsWindow(self.src_hwnd):
-            messagebox.showwarning(APP_NAME, "先に切り出し元のウィンドウを選んでください。")
-            return
-        if self.hidden_saved:  # 範囲を選ぶには Discord が見えている必要がある
-            self.show_discord()
-        hidden = [v for v in self.viewers if v.win.state() != "withdrawn"]
-        for v in hidden:
-            v.win.withdraw()
-        self.root.withdraw()
-
-        def done(frac):
-            self.root.deiconify()
-            for v in hidden:
-                v.win.deiconify()
-                v.thumb_src = None  # 再表示後にサムネイルを張り直す
-                v.win.after(100, v.update)
-            callback(frac)
-
-        self.root.after(150, lambda: RegionSelector(self.root, self.src_hwnd, done))
-
-    def add_viewer(self):
-        def done(frac):
-            if frac:
-                n = sum(1 for v in self.viewers if not v.auto_name) + 1
-                self.viewers.append(Viewer(self, f"手動 {n}", frac))
-                self.refresh_list()
-        self.select_region(done)
-
+    # --- 切り出しウィンドウ一覧
     def remove_viewer(self, v):
         if v in self.viewers:
             self.viewers.remove(v)
@@ -1008,11 +852,7 @@ class App:
             dot.pack(side="left")
             name = label(b, v.name, 10, bold=True)
             name.pack(side="left", padx=(6, 0))
-            badge = tk.Label(b, text="自動" if v.auto_name else "手動", font=(FONT_BOLD, 7), padx=5,
-                             bg=C["accent"] if v.auto_name else "#4e5058", fg="white")
-            badge.pack(side="left", padx=8)
             IconButton(b, "close", lambda v=v: v.close(), "閉じる").pack(side="right")
-            IconButton(b, "crop", lambda v=v: v.reselect(), "範囲を選び直す").pack(side="right")
             IconButton(b, "front", lambda v=v: (v.win.deiconify(), v.win.lift()), "前面に出す").pack(side="right")
             pin = IconButton(b, "pinned" if v.topmost.get() else "pin", lambda v=v: self.toggle_pin(v),
                              "常に最前面", active=v.topmost.get())
@@ -1050,8 +890,8 @@ class App:
             return {}
         if not isinstance(cfg.get("auto_geometries"), dict):
             cfg["auto_geometries"] = {}
-        if not isinstance(cfg.get("viewers"), list):
-            cfg["viewers"] = []
+        cfg.pop("viewers", None)  # 旧バージョンの手動切り出しの配置（機能削除済み）
+        cfg.pop("auto_restore", None)
         if cfg.get("hq_size") not in dict(HQ_OPTIONS):
             cfg.pop("hq_size", None)
         if not isinstance(cfg.get("target_exe", ""), str):
@@ -1066,44 +906,15 @@ class App:
             json.dump(cfg, fp, ensure_ascii=False, indent=2)
         os.replace(tmp, self.cfg_path)
 
-    def save_layout(self, quiet=False):
+    def save_settings(self):
+        """設定と、配信者ごとのウィンドウ位置を保存（終了時に呼ばれる）"""
         for v in self.viewers:
-            if v.auto_name:
-                self.auto_geometries[v.auto_name] = v.to_dict()
-        manual = [v.to_dict() for v in self.viewers if not v.auto_name]
+            self.auto_geometries[v.auto_name] = v.to_dict()
         cfg = self.read_cfg()
-        if manual or not quiet:
-            cfg["viewers"] = manual
-        cfg.update({"target_exe": self.target_exe, "auto_restore": self.auto_restore.get(),
-                    "auto_mode": self.auto_mode.get(), "auto_geometries": self.auto_geometries,
-                    "auto_hide_min": self.auto_hide_min.get(), "discord_hidden": self.hidden_saved,
-                    "hq_size": self.hq_size.get()})
+        cfg.update({"target_exe": self.target_exe, "auto_mode": self.auto_mode.get(),
+                    "auto_geometries": self.auto_geometries, "auto_hide_min": self.auto_hide_min.get(),
+                    "discord_hidden": self.hidden_saved, "hq_size": self.hq_size.get()})
         self.write_cfg(cfg)
-        if not quiet:
-            self.status.config(text=f"配置を保存しました（手動 {len(manual)} 個 ・ 自動の配信は配信者ごとに記憶）")
-
-    def load_layout(self):
-        cfg = self.read_cfg()
-        if not cfg.get("viewers"):
-            messagebox.showinfo(APP_NAME, "保存された手動の配置がありません。")
-            return
-        self.apply_layout(cfg)
-
-    def apply_layout(self, cfg):
-        for v in [v for v in self.viewers if not v.auto_name]:
-            v.close()
-        self.target_exe = cfg.get("target_exe") or self.target_exe
-        hwnd = find_window_by_exe(self.target_exe)
-        if hwnd:
-            self.set_source(hwnd, self.target_exe)
-            self.refresh_windows()
-        for d in cfg["viewers"]:
-            if not isinstance(d, dict) or not _valid_frac(d.get("frac")):
-                continue  # 壊れた項目は読み飛ばす
-            self.viewers.append(Viewer(self, str(d.get("name", "配信")), list(d["frac"]), d.get("geometry"),
-                                       d.get("topmost", False), d.get("keep_aspect", True),
-                                       d.get("opacity", 255)))
-        self.refresh_list()
 
     def quit(self):
         self.quitting = True
@@ -1113,9 +924,9 @@ class App:
         if self.hidden_saved:  # 隠したまま終了しない
             self.show_discord(activate=False)
         try:
-            self.save_layout(quiet=True)
-        except Exception:
-            pass
+            self.save_settings()
+        except Exception as e:
+            log_error("save_settings", e)
         for v in list(self.viewers):
             v.unregister()
         self.root.destroy()
